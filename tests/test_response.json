@@ -1,1 +1,0 @@
-{"success":true,"data":{"enabled":true,"provider":"modelscope","modelscope":{"api_key":"","model":"Tongyi-MAI/Z-Image-Turbo","timeout":120},"trigger_keywords":["画","生成图片","生图","绘制"],"generating_message":"🎨 正在为你生成图片，请稍候...","error_message":"😢 图片生成失败：{error}","success_message":"✨ 图片已生成完成！"}}
