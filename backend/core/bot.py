@@ -1,0 +1,1636 @@
+from typing import List, Dict, Any, AsyncGenerator, Optional, Set, Tuple
+from datetime import datetime
+import json
+import copy
+import logging
+import re
+import random
+import time
+from collections import defaultdict
+from ..providers import get_provider
+from ..config import config
+from ..tts.manager import TTSManager
+from ..image_gen import ImageGenerationManager, ImageGenerationConfig
+from ..vision import VisionRecognitionManager, VisionRecognitionConfig
+from ..asr import ASRManager, ASRConfig
+from ..memory import MemoryManager, MemoryConfig
+from ..mcp import MCPManager
+from ..emote import EmoteManager, EmoteConfig
+from ..user import user_manager
+from ..utils.config_merger import config_merger
+from ..utils.datetime_utils import get_now, from_isoformat
+from .gen_img_parser import extract_gen_img_prompt
+
+
+class Bot:
+    """Bot 核心类，处理对话与多模态协作，支持多用户配置"""
+    
+    def __init__(self):
+        self.logger = logging.getLogger(__name__)
+        self.provider_name = config.llm_config.get('provider', 'openai')
+        self.provider = get_provider(self.provider_name)
+        self.system_prompt = config.system_prompt
+        self._provider_signature = None
+        self._tts_signature = None
+        self.session_histories: Dict[str, List[Dict[str, str]]] = {}
+        self._history_loaded_sessions: Set[str] = set()
+        self.mcp_manager = MCPManager()
+
+        # 用户配置缓存
+        self._user_configs: Dict[str, Dict[str, Any]] = {}
+        self._user_config_cache_time: Dict[str, datetime] = {}
+        self._config_cache_ttl = 300  # 配置缓存有效期（秒）
+
+        # 用户级别的 LLM/TTS 实例缓存（避免每次请求都重建）
+        self._user_providers: Dict[str, Any] = {}
+        self._user_provider_signatures: Dict[str, str] = {}
+        self._user_tts_managers: Dict[str, TTSManager] = {}
+        self._user_tts_signatures: Dict[str, str] = {}
+        self._user_image_gen_managers: Dict[str, ImageGenerationManager] = {}
+        self._user_image_gen_signatures: Dict[str, str] = {}
+        self._session_last_companion_hint_turn: Dict[str, int] = {}
+
+        # 存储最近生成的图片（用于API返回）
+        self._last_generated_image: Optional[Dict[str, Any]] = None
+        
+        # 初始化TTS管理器
+        self.tts_manager: Optional[TTSManager] = None
+        try:
+            tts_config = config.tts_config if hasattr(config, 'tts_config') else {}
+            self.tts_manager = TTSManager(tts_config)
+            self._tts_signature = json.dumps(tts_config, sort_keys=True, ensure_ascii=False)
+        except Exception as e:
+            print(f"TTS初始化失败: {str(e)}")
+        
+        # 初始化图像生成管理器
+        self.image_gen_manager: Optional[ImageGenerationManager] = None
+        try:
+            image_gen_config = config.image_gen_config if hasattr(config, 'image_gen_config') else ImageGenerationConfig()
+            self.image_gen_manager = ImageGenerationManager(image_gen_config)
+        except Exception as e:
+            print(f"图像生成初始化失败: {str(e)}")
+        
+        # 初始化视觉识别管理器
+        self.vision_manager: Optional[VisionRecognitionManager] = None
+        try:
+            vision_config = config.vision_config if hasattr(config, 'vision_config') else VisionRecognitionConfig()
+            self.vision_manager = VisionRecognitionManager(vision_config)
+        except Exception as e:
+            print(f"视觉识别初始化失败: {str(e)}")
+
+        # 初始化ASR语音识别管理器
+        self.asr_manager: Optional[ASRManager] = None
+        try:
+            asr_config = config.asr_config if hasattr(config, 'asr_config') else ASRConfig()
+            self.asr_manager = ASRManager(asr_config)
+        except Exception as e:
+            print(f"ASR初始化失败: {str(e)}")
+
+        # 初始化记忆管理器
+        self.memory_manager = None
+        try:
+            memory_config = config.memory_config if hasattr(config, 'memory_config') else MemoryConfig()
+            
+            from ..memory.manager import MemoryManager
+            self.logger.info("使用向量记忆系统（需要嵌入模型）")
+            self.memory_manager = MemoryManager(memory_config)
+            
+            self._memory_manager_init_failed = False
+            # 注意：记忆管理器需要异步初始化，将在第一次使用时初始化
+        except Exception as e:
+            print(f"记忆管理器初始化失败: {str(e)}")
+            self._memory_manager_init_failed = True
+
+        # 初始化表情包管理器
+        self.emote_manager: Optional[EmoteManager] = None
+        self._emote_signature = None
+        try:
+            emote_config = config.emote_config if hasattr(config, 'emote_config') else EmoteConfig()
+            self.emote_manager = EmoteManager(emote_config)
+            self._emote_signature = json.dumps(emote_config.dict(), sort_keys=True, ensure_ascii=False)
+        except Exception as e:
+            print(f"表情包功能初始化失败: {str(e)}")
+            self._emote_signature = None
+        
+        # 初始化时记录提供商签名
+        self._refresh_provider(force=True)
+
+    def _get_session_history(self, session_id: str, user_id: str = "default") -> List[Dict[str, str]]:
+        """获取或初始化指定会话的对话历史"""
+        history = self.session_histories.get(session_id)
+        if history is None:
+            history = []
+            self.session_histories[session_id] = history
+
+        # 确保 system prompt 与当前“用户配置/全局配置”一致（支持运行时修改）
+        system_prompt = self._get_user_system_prompt(user_id)
+        if system_prompt:
+            if history and history[0].get("role") == "system":
+                history[0]["content"] = system_prompt
+            else:
+                history.insert(0, {"role": "system", "content": system_prompt})
+        return history
+
+    def _history_limit(self) -> int:
+        """获取历史记录保留上限"""
+        if self.memory_manager and hasattr(self.memory_manager, "config"):
+            try:
+                return max(2, self.memory_manager.config.short_term_max_rounds * 2)
+            except Exception:
+                pass
+        return 20
+
+    def _trim_conversation_history(self, session_id: str, user_id: str = "default"):
+        """保持对话历史在配置上限内"""
+        history = self._get_session_history(session_id, user_id)
+        limit = self._history_limit()
+        if len(history) > limit:
+            if history and history[0].get("role") == "system":
+                self.session_histories[session_id] = [history[0]] + history[-(limit - 1):]
+            else:
+                self.session_histories[session_id] = history[-limit:]
+
+    async def _load_history_from_memory(self, user_id: str, session_id: Optional[str] = None):
+        """从持久化存储中恢复短期对话历史，避免重启丢失上下文"""
+        if not self.memory_manager:
+            return
+        session_id = session_id or user_id
+        if session_id in self._history_loaded_sessions:
+            return
+        if not await self._ensure_memory_manager_initialized():
+            return
+
+        try:
+            limit = self._history_limit()
+            memories = await self.memory_manager.get_short_term_memories(
+                user_id=user_id,
+                session_id=session_id,
+                limit=limit
+            )
+        except Exception as e:
+            print(f"[DEBUG] 恢复历史时获取短期记忆失败: {e}")
+            return
+
+        restored_history: List[Dict[str, str]] = []
+        for mem in memories:
+            message = mem.get("message") or {}
+            role = message.get("role")
+            content = message.get("content")
+            if role and content:
+                restored_message: Dict[str, Any] = {"role": role, "content": content}
+                message_ts = message.get("timestamp")
+                if message_ts:
+                    restored_message["timestamp"] = message_ts
+                restored_history.append(restored_message)
+
+        if restored_history:
+            base_history = []
+            if self.system_prompt:
+                base_history.append({"role": "system", "content": self.system_prompt})
+            self.session_histories[session_id] = base_history + restored_history
+            try:
+                state = await self.memory_manager._get_session_state(session_id, user_id)
+                state["round_count"] = len(restored_history)
+                state["updated_at"] = get_now().isoformat()
+            except Exception as e:
+                print(f"[DEBUG] 恢复记忆时更新会话状态失败: {e}")
+
+        self._history_loaded_sessions.add(session_id)
+
+    def _refresh_provider(self, force: bool = False):
+        """检测LLM配置是否变化，必要时刷新provider"""
+        try:
+            config.refresh_from_file()
+        except Exception as e:
+            print(f"刷新配置失败: {e}")
+            # 即便刷新失败也继续使用当前配置
+
+        llm_cfg = config.llm_config or {}
+        signature = json.dumps(llm_cfg, sort_keys=True, ensure_ascii=False)
+
+        if force or signature != self._provider_signature:
+            self.provider_name = llm_cfg.get('provider', 'openai')
+            self.provider = get_provider(self.provider_name, llm_config=llm_cfg)
+            self.system_prompt = config.system_prompt
+            self._provider_signature = signature
+        
+        # 同步TTS配置，支持热更新
+        self._refresh_tts_manager()
+        # 同步表情包配置
+        self._refresh_emote_manager()
+    
+    async def _ensure_memory_manager_initialized(self):
+        """确保MemoryManager已初始化"""
+        if self.memory_manager is None:
+            return False
+        
+        # 如果已经尝试初始化但失败了，不再尝试
+        if hasattr(self, '_memory_manager_init_failed') and self._memory_manager_init_failed:
+            return False
+        
+        # 检查是否已初始化（简化：检查engine是否存在）
+        if hasattr(self.memory_manager, 'engine') and self.memory_manager.engine is None:
+            try:
+                await self.memory_manager.initialize()
+                self.logger.info("MemoryManager已初始化")
+            except Exception as e:
+                print(f"MemoryManager初始化失败: {e}")
+                self._memory_manager_init_failed = True
+                return False
+        
+        return True
+    
+    async def _get_relevant_memories(self, user_id: str, query: str) -> List[Dict[str, Any]]:
+        """获取相关记忆（长期记忆）"""
+        if not self.memory_manager or not await self._ensure_memory_manager_initialized():
+            return []
+        
+        try:
+            memories = await self.memory_manager.search_long_term_memories(
+                user_id=user_id,
+                query=query
+            )
+            return memories
+        except Exception as e:
+            print(f"获取相关记忆失败: {e}")
+            return []
+
+    async def _append_mid_term_context(self, enhanced_history: List[Dict[str, str]],
+                                      user_id: str, session_id: str):
+        """将中期摘要注入到LLM上下文中（用于连续性）"""
+        if not self.memory_manager or not await self._ensure_memory_manager_initialized():
+            return
+
+        try:
+            count = int(getattr(config.memory_config, "mid_term_context_count", 0) or 0)
+        except Exception:
+            count = 0
+        if count <= 0:
+            return
+        if not getattr(config.memory_config, "mid_term_enabled", True):
+            return
+
+        try:
+            summaries = await self.memory_manager.get_mid_term_summaries(
+                user_id=user_id,
+                session_id=session_id,
+                limit=count
+            )
+        except Exception as e:
+            print(f"获取中期摘要失败: {e}")
+            return
+
+        if not summaries:
+            return
+
+        summaries = list(reversed(summaries))
+        lines: List[str] = []
+        for item in summaries:
+            text = str(item.get("summary") or "").strip()
+            if not text:
+                continue
+            range_info = item.get("conversation_range")
+            if range_info:
+                lines.append(f"- {text} (范围 {range_info})")
+            else:
+                lines.append(f"- {text}")
+
+        if not lines:
+            return
+
+        context = "以下是最近的对话摘要（中期记忆），用于保持连续性；只在与当前问题直接相关时自然参考，不要逐条复述：\n" + "\n".join(lines)
+        if enhanced_history and enhanced_history[0]["role"] == "system":
+            enhanced_history[0]["content"] = enhanced_history[0]["content"] + "\n\n" + context
+        else:
+            enhanced_history.insert(0, {
+                "role": "system",
+                "content": context
+            })
+    
+    def _normalize_text_for_compare(self, text: str) -> str:
+        """归一化文本，便于进行轻量去重匹配。"""
+        raw = str(text or "").strip().lower()
+        if not raw:
+            return ""
+        compact = re.sub(r"\s+", "", raw)
+        compact = re.sub(r"[^\w\u4e00-\u9fff]", "", compact)
+        return compact
+
+    def _to_llm_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+        """清洗消息结构，避免将内部字段（如timestamp）传给LLM接口。"""
+        cleaned: List[Dict[str, str]] = []
+        for message in messages:
+            role = str(message.get("role", "") or "").strip()
+            if not role:
+                continue
+            cleaned.append({
+                "role": role,
+                "content": str(message.get("content", "") or "")
+            })
+        return cleaned
+
+    def _extract_message_timestamp(self, message: Dict[str, Any]) -> Optional[datetime]:
+        """从历史消息中解析时间戳。"""
+        raw_ts = message.get("timestamp")
+        if not raw_ts:
+            return None
+        if isinstance(raw_ts, datetime):
+            return raw_ts
+        if isinstance(raw_ts, str):
+            try:
+                return from_isoformat(raw_ts)
+            except Exception:
+                return None
+        return None
+
+    def _is_same_question(self, current_message: str, previous_message: str) -> bool:
+        """判断两条用户消息是否属于同类重复问法。"""
+        current = self._normalize_text_for_compare(current_message)
+        previous = self._normalize_text_for_compare(previous_message)
+        if not current or not previous:
+            return False
+        if current == previous:
+            return True
+        if min(len(current), len(previous)) >= 4 and max(len(current), len(previous)) <= 16:
+            if current in previous or previous in current:
+                return True
+        return False
+
+    def _build_long_gap_repeat_hint(self, history: List[Dict[str, Any]], current_message: str) -> str:
+        """当同类问题间隔较久时，提示模型按“新一轮状态”回答。"""
+        if not history or not current_message:
+            return ""
+
+        threshold = getattr(config.memory_config, "same_question_reset_minutes", 45)
+        try:
+            threshold_minutes = max(1, int(threshold))
+        except Exception:
+            threshold_minutes = 45
+
+        last_user_message: Optional[Dict[str, Any]] = None
+        for item in reversed(history):
+            if item.get("role") == "user":
+                last_user_message = item
+                break
+
+        if not last_user_message:
+            return ""
+        if not self._is_same_question(current_message, str(last_user_message.get("content", "") or "")):
+            return ""
+
+        last_ts = self._extract_message_timestamp(last_user_message)
+        if not last_ts:
+            return ""
+
+        gap_seconds = (get_now() - last_ts).total_seconds()
+        if gap_seconds < threshold_minutes * 60:
+            return ""
+
+        gap_minutes = int(gap_seconds // 60)
+        return (
+            f"用户这次同类提问与上次已间隔约 {gap_minutes} 分钟，"
+            "应视为新的时间点，请按当前状态重新回答；不要说“刚说过/你又问了”。"
+        )
+
+    def _build_companion_mode_hint(self, session_id: str,
+                                   history: List[Dict[str, Any]],
+                                   current_message: str) -> str:
+        """构建“AI伴侣化”动态提示，降低纯问答感。"""
+        llm_cfg = config.llm_config or {}
+        mode_cfg = llm_cfg.get("companion_mode", {})
+        if not isinstance(mode_cfg, dict):
+            mode_cfg = {}
+
+        enabled = mode_cfg.get("enabled", llm_cfg.get("companion_mode_enabled", True))
+        if not bool(enabled):
+            return ""
+
+        try:
+            share_prob = float(mode_cfg.get(
+                "spontaneous_share_probability",
+                llm_cfg.get("companion_spontaneous_share_probability", 0.35)
+            ))
+        except Exception:
+            share_prob = 0.35
+        share_prob = max(0.0, min(1.0, share_prob))
+
+        try:
+            relation_prob = float(mode_cfg.get(
+                "relationship_reflection_probability",
+                llm_cfg.get("companion_relationship_reflection_probability", 0.18)
+            ))
+        except Exception:
+            relation_prob = 0.18
+        relation_prob = max(0.0, min(1.0, relation_prob))
+
+        try:
+            min_turn_gap = int(mode_cfg.get("min_turn_gap", llm_cfg.get("companion_min_turn_gap", 2)))
+        except Exception:
+            min_turn_gap = 2
+        min_turn_gap = max(1, min_turn_gap)
+
+        try:
+            statement_end_prob = float(mode_cfg.get(
+                "statement_end_probability",
+                llm_cfg.get("companion_statement_end_probability", 0.7)
+            ))
+        except Exception:
+            statement_end_prob = 0.7
+        statement_end_prob = max(0.0, min(1.0, statement_end_prob))
+
+        if not hasattr(self, "_session_last_companion_hint_turn"):
+            self._session_last_companion_hint_turn = {}
+
+        current_turn = sum(1 for item in history if item.get("role") == "user") + 1
+        last_hint_turn = int(self._session_last_companion_hint_turn.get(session_id, 0) or 0)
+        if current_turn - last_hint_turn < min_turn_gap:
+            return ""
+
+        if random.random() > share_prob:
+            return ""
+
+        self._session_last_companion_hint_turn[session_id] = current_turn
+        include_relation = random.random() < relation_prob
+        statement_end = random.random() < statement_end_prob
+
+        hint_parts = [
+            "本轮回复请避免只做问答式复述：先正常回应用户，再自然补1句你自己的近况/想法/情绪（10-30字）。",
+            "像真实伴侣聊天，允许轻微跑题和碎碎念，但保持温柔、简短。"
+        ]
+
+        if include_relation:
+            hint_parts.append(
+                "可偶尔提一句关系里的真实感受或小需求（温和不指责），如想被多陪陪、异地见面安排、轻微没安全感。"
+            )
+
+        if statement_end:
+            hint_parts.append("这轮优先用陈述句收尾，不必每次都反问。")
+
+        if len(current_message.strip()) <= 4:
+            hint_parts.append("用户这句很短，你的回复依然可以短，但要保留一点‘你自己的状态’。")
+
+        return " ".join(hint_parts)
+
+    def _build_memory_context(self, relevant_memories: List[Dict[str, Any]],
+                              history: List[Dict[str, str]], limit: int = 3) -> str:
+        """构建长期记忆上下文，过滤与近期对话重复的内容。"""
+        if not relevant_memories:
+            return ""
+
+        try:
+            limit = max(1, int(limit))
+        except Exception:
+            limit = 3
+
+        recent_norms: List[str] = []
+        for message in history[-10:]:
+            normalized = self._normalize_text_for_compare(message.get("content", ""))
+            if normalized:
+                recent_norms.append(normalized)
+
+        selected_lines: List[str] = []
+        seen_contents: Set[str] = set()
+
+        sorted_memories = sorted(
+            relevant_memories,
+            key=lambda mem: float(mem.get("similarity", 0) or 0),
+            reverse=True
+        )
+
+        for mem in sorted_memories:
+            content = str(mem.get("content", "") or "").strip()
+            if not content:
+                continue
+
+            normalized = self._normalize_text_for_compare(content)
+            if not normalized or normalized in seen_contents:
+                continue
+
+            if any(
+                len(normalized) >= 10 and (normalized in recent or recent in normalized)
+                for recent in recent_norms if recent
+            ):
+                continue
+
+            seen_contents.add(normalized)
+            try:
+                similarity = float(mem.get("similarity", 0) or 0)
+            except Exception:
+                similarity = 0.0
+            selected_lines.append(f"{len(selected_lines) + 1}. {content} (相关度: {similarity:.2f})")
+
+            if len(selected_lines) >= limit:
+                break
+
+        if not selected_lines:
+            return ""
+
+        return (
+            "以下是可参考的关系记忆（仅在与当前问题直接相关时自然带一句，"
+            "不要逐条回答、不要复述原句）：\n"
+            + "\n".join(selected_lines)
+        )
+    
+    def _refresh_tts_manager(self):
+        """检测TTS配置变化，必要时热更新TTS管理器"""
+        try:
+            # 确保最新配置（即便LLM未变化也刷新）
+            try:
+                config.refresh_from_file()
+            except Exception:
+                pass
+
+            tts_cfg = config.tts_config if hasattr(config, 'tts_config') else {}
+            signature = json.dumps(tts_cfg, sort_keys=True, ensure_ascii=False)
+            if self.tts_manager is None or signature != self._tts_signature:
+                self.tts_manager = TTSManager(tts_cfg)
+                self._tts_signature = signature
+        except Exception as e:
+            print(f"刷新TTS配置失败: {str(e)}")
+
+    def _refresh_emote_manager(self):
+        """检测表情包配置变化，必要时刷新管理器"""
+        try:
+            try:
+                config.refresh_from_file()
+            except Exception:
+                pass
+            emote_cfg = config.emote_config if hasattr(config, 'emote_config') else EmoteConfig()
+            signature = json.dumps(emote_cfg.dict(), sort_keys=True, ensure_ascii=False)
+            if self.emote_manager is None or signature != self._emote_signature:
+                self.emote_manager = EmoteManager(emote_cfg)
+                self._emote_signature = signature
+        except Exception as e:
+            print(f"刷新表情包配置失败: {str(e)}")
+    
+    async def _add_conversation_to_memory(self, user_id: str, session_id: str, 
+                                        user_message: str, assistant_response: str):
+        """添加对话到记忆系统"""
+        if not self.memory_manager or not await self._ensure_memory_manager_initialized():
+            return
+        
+        try:
+            from ..memory.models import ConversationMessage
+            from datetime import datetime
+
+            # 记忆中存储精简版，避免CQ码/过长描述污染上下文
+            memory_user_message = self._sanitize_for_memory(user_message)
+            memory_assistant_response = self._sanitize_for_memory(assistant_response)
+            
+            # 添加用户消息
+            user_msg = ConversationMessage(
+                role="user",
+                content=memory_user_message,
+                timestamp=get_now()
+            )
+            await self.memory_manager.add_short_term_memory(user_id, session_id, user_msg)
+            
+            # 添加助手回复
+            assistant_msg = ConversationMessage(
+                role="assistant",
+                content=memory_assistant_response,
+                timestamp=get_now()
+            )
+            await self.memory_manager.add_short_term_memory(user_id, session_id, assistant_msg)
+        except Exception as e:
+            print(f"添加对话到记忆失败: {e}")
+    
+    async def _get_user_config(self, user_id: str) -> Dict[str, Any]:
+        """获取用户配置（带缓存）
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            用户配置字典
+        """
+        # 检查缓存是否有效
+        current_time = get_now()
+        if user_id in self._user_config_cache_time:
+            cache_time = self._user_config_cache_time[user_id]
+            if (current_time - cache_time).total_seconds() < self._config_cache_ttl:
+                return self._user_configs.get(user_id, {})
+        
+        # 从数据库加载用户配置
+        user_config = {}
+        
+        # 尝试通过 QQ 用户 ID 获取用户
+        try:
+            user = await user_manager.get_user_by_qq_id(user_id)
+            if user:
+                user_config = await user_manager.get_user_config_dict(user.id)
+            else:
+                # QQ 多用户：首次接触自动建档（默认继承全局配置）
+                if str(user_id).isdigit():
+                    try:
+                        created = await user_manager.get_or_create_user_by_qq_id(str(user_id))
+                        user_config = await user_manager.get_user_config_dict(created.id)
+                        user = created
+                    except Exception as e:
+                        self.logger.warning(f"自动创建 QQ 用户失败 user_id={user_id}: {e}")
+
+                # Web 端常见：直接传 user.id（数字字符串）
+                if str(user_id).isdigit():
+                    user_by_id = await user_manager.get_user_by_id(int(user_id))
+                    if user_by_id:
+                        user_config = await user_manager.get_user_config_dict(user_by_id.id)
+        except Exception as e:
+            self.logger.warning(f"获取用户配置失败: {e}")
+        
+        # 更新缓存
+        self._user_configs[user_id] = user_config
+        self._user_config_cache_time[user_id] = current_time
+        
+        return user_config
+    
+    def _get_merged_config(self, user_id: str) -> Dict[str, Any]:
+        """获取合并后的用户配置
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            合并后的配置字典
+        """
+        # 获取用户配置（从缓存，因为是同步方法）
+        user_config = self._user_configs.get(user_id, {})
+        
+        # 获取全局配置
+        global_config = {
+            'system_prompt': config.system_prompt,
+            'llm': config.llm_config,
+            'tts': config.tts_config,
+            'image_generation': config.image_gen_config.dict() if hasattr(config.image_gen_config, 'dict') else {},
+            'vision': config.vision_config.dict() if hasattr(config.vision_config, 'dict') else {},
+            'emotes': config.emote_config.dict() if hasattr(config.emote_config, 'dict') else {},
+            'prompt_enhancer': config.prompt_enhancer_config.dict() if hasattr(config.prompt_enhancer_config, 'dict') else {},
+            'proactive_chat': config.proactive_chat_config,
+        }
+        
+        # 合并配置
+        merged_config = config_merger.get_user_config(global_config, user_config, skip_empty=True)
+        
+        return merged_config
+
+    def _get_user_llm_provider(self, user_id: str) -> Any:
+        """获取该用户的 LLM Provider（按用户配置缓存）。"""
+        merged = self._get_merged_config(user_id)
+        llm_cfg = merged.get("llm", {}) or {}
+        signature = json.dumps(llm_cfg, sort_keys=True, ensure_ascii=False)
+
+        cached = self._user_providers.get(user_id)
+        if cached is not None and self._user_provider_signatures.get(user_id) == signature:
+            return cached
+
+        try:
+            provider_name = llm_cfg.get("provider", "openai")
+            provider = get_provider(provider_name, llm_config=llm_cfg)
+        except Exception as e:
+            # 用户配置不完整时回退到全局 provider，避免影响可用性
+            self.logger.warning(f"用户 LLM 配置无效，回退全局配置 user_id={user_id}: {e}")
+            provider = self.provider
+
+        self._user_providers[user_id] = provider
+        self._user_provider_signatures[user_id] = signature
+        return provider
+
+    def _get_user_tts_manager(self, user_id: str) -> Optional[TTSManager]:
+        """获取该用户的 TTSManager（按用户配置缓存）。"""
+        merged = self._get_merged_config(user_id)
+        tts_cfg = merged.get("tts", {}) or {}
+        signature = json.dumps(tts_cfg, sort_keys=True, ensure_ascii=False)
+
+        cached = self._user_tts_managers.get(user_id)
+        if cached is not None and self._user_tts_signatures.get(user_id) == signature:
+            return cached
+
+        try:
+            manager = TTSManager(tts_cfg)
+        except Exception as e:
+            self.logger.warning(f"用户 TTS 配置无效，禁用 TTS user_id={user_id}: {e}")
+            manager = None
+
+        if manager is not None:
+            self._user_tts_managers[user_id] = manager
+            self._user_tts_signatures[user_id] = signature
+
+        return manager
+
+    def _get_user_image_gen_manager(self, user_id: str) -> Optional[ImageGenerationManager]:
+        """获取该用户的 ImageGenerationManager（按用户配置缓存）。"""
+        merged = self._get_merged_config(user_id)
+        image_cfg = merged.get("image_generation", {}) or {}
+        signature = json.dumps(image_cfg, sort_keys=True, ensure_ascii=False)
+
+        cached = self._user_image_gen_managers.get(user_id)
+        if cached is not None and self._user_image_gen_signatures.get(user_id) == signature:
+            return cached
+
+        try:
+            manager = ImageGenerationManager(ImageGenerationConfig(**image_cfg))
+        except Exception as e:
+            self.logger.warning(f"用户图像生成配置无效，禁用图像生成 user_id={user_id}: {e}")
+            return None
+
+        self._user_image_gen_managers[user_id] = manager
+        self._user_image_gen_signatures[user_id] = signature
+        return manager
+    
+    def _get_user_system_prompt(self, user_id: str) -> str:
+        """获取用户的系统提示词
+        
+        Args:
+            user_id: 用户ID
+            
+        Returns:
+            系统提示词
+        """
+        user_config = self._user_configs.get(user_id, {})
+        return config_merger.get_system_prompt(config.system_prompt, user_config.get('system_prompt'))
+    
+    async def chat(self, message: str, user_id: str = "default", session_id: Optional[str] = None) -> str:
+        """发送消息并获取回复"""
+        try:
+            session_id = session_id or user_id
+            
+            # 加载用户配置
+            await self._get_user_config(user_id)
+
+            # 确保全局配置热更新（但真正调用用用户 provider）
+            self._refresh_provider()
+            provider = self._get_user_llm_provider(user_id)
+
+            # 检测待办事项意图
+            reminder_confirmation = await self._check_reminder_intent(message, user_id, session_id)
+
+            # 恢复最近的对话历史作为短期上下文
+            await self._load_history_from_memory(user_id, session_id)
+            history = self._get_session_history(session_id, user_id)
+
+            # 获取相关记忆（长期记忆）作为上下文
+            relevant_memories = []
+            if self.memory_manager:
+                relevant_memories = await self._get_relevant_memories(user_id, message)
+
+            # 构建增强的对话历史（包含记忆和 MCP 上下文）
+            enhanced_history = copy.deepcopy(history)
+
+            # 同类问题间隔较久时按“新一轮近况”处理，避免误判为重复提问
+            long_gap_repeat_hint = self._build_long_gap_repeat_hint(history, message)
+            if long_gap_repeat_hint:
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    enhanced_history[0]["content"] += "\n\n" + long_gap_repeat_hint
+                else:
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": long_gap_repeat_hint
+                    })
+
+            # 降低问答机器人感：按概率提示“主动分享一点自己的状态/关系感受”
+            companion_hint = self._build_companion_mode_hint(session_id, history, message)
+            if companion_hint:
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    enhanced_history[0]["content"] += "\n\n" + companion_hint
+                else:
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": companion_hint
+                    })
+
+            # 从 MCP 扩展收集自动上下文（例如当前时间）
+            mcp_blocks: List[str] = []
+            if self.mcp_manager:
+                try:
+                    mcp_blocks = await self.mcp_manager.collect_auto_context(message)
+                except Exception as e:
+                    print(f"[DEBUG] 检索 MCP 自动上下文失败: {e}")
+            if mcp_blocks:
+                mcp_context = "以下是 MCP 提供的实时上下文：\n" + "\n".join(
+                    f"- {block}" for block in mcp_blocks
+                )
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    enhanced_history[0]["content"] += "\n\n" + mcp_context
+                else:
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": mcp_context
+                    })
+
+            # 注入中期摘要上下文（可配置条数）
+            await self._append_mid_term_context(enhanced_history, user_id, session_id)
+            
+            # 如果有相关记忆，添加到上下文中
+            memory_context = self._build_memory_context(relevant_memories, history, limit=3)
+            if memory_context:
+                # 将记忆上下文作为系统消息插入（在系统提示词之后）
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    # 在系统提示词后插入记忆上下文
+                    original_system_prompt = enhanced_history[0]["content"]
+                    enhanced_history[0]["content"] = original_system_prompt + "\n\n" + memory_context
+                else:
+                    # 添加记忆上下文作为第一条系统消息
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": memory_context
+                    })
+            
+            # 添加用户消息到历史
+            enhanced_history.append({
+                "role": "user",
+                "content": message
+            })
+            
+            # 调用LLM API（使用增强的历史）
+            response = await provider.chat(self._to_llm_messages(enhanced_history))
+            
+            # 记录到当前会话的基础对话历史（不包含扩展上下文）
+            now_ts = get_now().isoformat()
+            history.append({
+                "role": "user",
+                "content": message,
+                "timestamp": now_ts
+            })
+            history.append({
+                "role": "assistant",
+                "content": response,
+                "timestamp": get_now().isoformat()
+            })
+            
+            # 保持历史记录在合理范围内
+            self._trim_conversation_history(session_id)
+            
+            # 将对话添加到记忆系统
+            await self._add_conversation_to_memory(user_id, session_id, message, response)
+
+            # 如果有待办事项确认消息，附加到回复中
+            if reminder_confirmation:
+                response = response + "\n\n" + reminder_confirmation
+
+            # 处理回复中的图片标签 [GEN_IMG: ...]
+            cleaned_response, image_data = await self._process_image_in_response(response, user_id, session_id)
+
+            # 如果有图片生成，将图片数据存储到实例中供API调用
+            if image_data:
+                self._last_generated_image = {
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "image_data": image_data
+                }
+                print(f"[Bot] 图片已生成，大小: {len(image_data)} bytes")
+
+            return cleaned_response
+            
+        except Exception as e:
+            error_msg = f"对话处理失败: {str(e)}"
+            print(error_msg)
+            return error_msg
+    
+    async def chat_stream(self, message: str, user_id: str = "default", session_id: Optional[str] = None) -> AsyncGenerator[str, None]:
+        """流式对话回复"""
+        trace_start = time.perf_counter()
+        stage_marks: Dict[str, float] = {}
+
+        def mark(stage: str):
+            stage_marks[stage] = round((time.perf_counter() - trace_start) * 1000, 2)
+
+        try:
+            session_id = session_id or user_id
+            mark("session_ready")
+
+            await self._get_user_config(user_id)
+            mark("user_config_loaded")
+            self._refresh_provider()
+            provider = self._get_user_llm_provider(user_id)
+            mark("provider_ready")
+
+            # 恢复最近的对话历史作为短期上下文
+            await self._load_history_from_memory(user_id, session_id)
+            history = self._get_session_history(session_id, user_id)
+            mark("history_loaded")
+
+            # 获取相关记忆（长期记忆）作为上下文
+            relevant_memories = []
+            if self.memory_manager:
+                relevant_memories = await self._get_relevant_memories(user_id, message)
+            mark("relevant_memories_loaded")
+            
+            # 构建增强的对话历史（包含记忆和 MCP 上下文）
+            enhanced_history = copy.deepcopy(history)
+
+            long_gap_repeat_hint = self._build_long_gap_repeat_hint(history, message)
+            if long_gap_repeat_hint:
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    enhanced_history[0]["content"] = enhanced_history[0]["content"] + "\n\n" + long_gap_repeat_hint
+                else:
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": long_gap_repeat_hint
+                    })
+
+            companion_hint = self._build_companion_mode_hint(session_id, history, message)
+            if companion_hint:
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    enhanced_history[0]["content"] = enhanced_history[0]["content"] + "\n\n" + companion_hint
+                else:
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": companion_hint
+                    })
+
+            # 从 MCP 扩展收集自动上下文
+            mcp_blocks: List[str] = []
+            if self.mcp_manager:
+                try:
+                    mcp_blocks = await self.mcp_manager.collect_auto_context(message)
+                except Exception as e:
+                    print(f"[DEBUG] 流式检索 MCP 自动上下文失败: {e}")
+            mark("mcp_context_loaded")
+            if mcp_blocks:
+                mcp_context = "以下是 MCP 提供的实时上下文：\n" + "\n".join(
+                    f"- {block}" for block in mcp_blocks
+                )
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    enhanced_history[0]["content"] += "\n\n" + mcp_context
+                else:
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": mcp_context
+                    })
+
+            # 注入中期摘要上下文（可配置条数）
+            await self._append_mid_term_context(enhanced_history, user_id, session_id)
+            mark("mid_term_context_loaded")
+            
+            # 如果有相关记忆，添加到上下文中
+            memory_context = self._build_memory_context(relevant_memories, history, limit=3)
+            if memory_context:
+                # 将记忆上下文作为系统消息插入（在系统提示词之后）
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    # 在系统提示词后插入记忆上下文
+                    original_system_prompt = enhanced_history[0]["content"]
+                    enhanced_history[0]["content"] = original_system_prompt + "\n\n" + memory_context
+                else:
+                    # 添加记忆上下文作为第一条系统消息
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": memory_context
+                    })
+            
+            # 添加用户消息到增强历史
+            enhanced_history.append({
+                "role": "user",
+                "content": message
+            })
+            mark("prompt_ready")
+            
+            # 同时添加用户消息到原始历史（不包含记忆上下文）
+            now_ts = get_now().isoformat()
+            history.append({
+                "role": "user",
+                "content": message,
+                "timestamp": now_ts
+            })
+            
+            # 调用LLM流式API（使用增强的历史）
+            full_response = ""
+            first_chunk_seen = False
+            mark("llm_stream_start")
+            async for chunk in provider.chat_stream(self._to_llm_messages(enhanced_history)):
+                if not first_chunk_seen:
+                    mark("llm_first_chunk")
+                    first_chunk_seen = True
+                full_response += chunk
+                yield chunk
+            mark("llm_stream_done")
+
+            # 处理回复中的图片标签 [GEN_IMG: ...]
+            cleaned_response, image_data = await self._process_image_in_response(full_response, user_id, session_id)
+            mark("image_processed")
+
+            # 如果有图片生成，将图片数据存储到实例中供API调用
+            if image_data:
+                self._last_generated_image = {
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "image_data": image_data
+                }
+                print(f"[Bot Stream] 图片已生成，大小: {len(image_data)} bytes")
+
+            # 如果清理后的响应与原始响应不同，需要重新记录到历史
+            if cleaned_response != full_response:
+                full_response = cleaned_response
+
+            # 添加完整回复到原始历史（不包含记忆上下文）
+            history.append({
+                "role": "assistant",
+                "content": full_response,
+                "timestamp": get_now().isoformat()
+            })
+
+            # 保持历史记录在合理范围内
+            self._trim_conversation_history(session_id)
+
+            # 将对话添加到记忆系统
+            await self._add_conversation_to_memory(user_id, session_id, message, full_response)
+            mark("conversation_persisted")
+
+            print(
+                f"[Latency][bot.chat_stream] user_id={user_id} session_id={session_id} "
+                f"stages_ms={json.dumps(stage_marks, ensure_ascii=False)} "
+                f"metrics={json.dumps({'relevant_memories': len(relevant_memories), 'mcp_blocks': len(mcp_blocks), 'history_messages': len(history)}, ensure_ascii=False)}"
+            )
+
+        except Exception as e:
+            mark("error")
+            print(
+                f"[Latency][bot.chat_stream][error] user_id={user_id} session_id={session_id} "
+                f"stages_ms={json.dumps(stage_marks, ensure_ascii=False)} error={str(e)}"
+            )
+            error_msg = f"流式对话处理失败: {str(e)}"
+            print(error_msg)
+            yield error_msg
+
+    async def generate_proactive_reply(self, instruction: str, user_id: str = "default") -> str:
+        """在没有用户输入的情况下生成一条主动问候的内容"""
+        try:
+            session_id = user_id
+            self._refresh_provider()
+            await self._get_user_config(user_id)
+            provider = self._get_user_llm_provider(user_id)
+            await self._load_history_from_memory(user_id, session_id)
+            history = self._get_session_history(session_id, user_id)
+
+            relevant_memories = []
+            if self.memory_manager:
+                relevant_memories = await self._get_relevant_memories(user_id, instruction)
+
+            enhanced_history = copy.deepcopy(history)
+
+            companion_hint = self._build_companion_mode_hint(session_id, history, instruction)
+            if companion_hint:
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    enhanced_history[0]["content"] = enhanced_history[0]["content"] + "\n\n" + companion_hint
+                else:
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": companion_hint
+                    })
+
+            # 添加 MCP 自动上下文（例如当前时间）
+            mcp_blocks: List[str] = []
+            if self.mcp_manager:
+                try:
+                    mcp_blocks = await self.mcp_manager.collect_auto_context(instruction)
+                except Exception as e:
+                    print(f"[DEBUG] 主动对话收集 MCP 上下文失败: {e}")
+            if mcp_blocks:
+                mcp_context = "以下是 MCP 提供的实时上下文：\n" + "\n".join(
+                    f"- {block}" for block in mcp_blocks
+                )
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    enhanced_history[0]["content"] = enhanced_history[0]["content"] + "\n\n" + mcp_context
+                else:
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": mcp_context
+                    })
+
+            # 注入中期摘要上下文（可配置条数）
+            await self._append_mid_term_context(enhanced_history, user_id, session_id)
+
+            memory_context = self._build_memory_context(relevant_memories, history, limit=3)
+            if memory_context:
+                if enhanced_history and enhanced_history[0]["role"] == "system":
+                    enhanced_history[0]["content"] = enhanced_history[0]["content"] + "\n\n" + memory_context
+                else:
+                    enhanced_history.insert(0, {
+                        "role": "system",
+                        "content": memory_context
+                    })
+
+            enhanced_history.append({
+                "role": "user",
+                "content": instruction
+            })
+
+            response = await provider.chat(self._to_llm_messages(enhanced_history))
+
+            history.append({
+                "role": "assistant",
+                "content": response,
+                "timestamp": get_now().isoformat()
+            })
+            self._trim_conversation_history(session_id)
+
+            await self._record_proactive_memory(user_id, response)
+            return response
+        except Exception as e:
+            error_msg = f"主动对话处理失败: {str(e)}"
+            print(error_msg)
+            return error_msg
+
+    async def _record_proactive_memory(self, user_id: str, assistant_response: str):
+        """仅记录一次主动问候的助手回复，避免写入虚构的用户内容"""
+        if not self.memory_manager:
+            return
+        if not await self._ensure_memory_manager_initialized():
+            return
+        try:
+            from ..memory.models import ConversationMessage
+            msg = ConversationMessage(
+                role="assistant",
+                content=self._sanitize_for_memory(assistant_response),
+                timestamp=get_now()
+            )
+            await self.memory_manager.add_short_term_memory(user_id, user_id, msg)
+        except Exception as e:
+            print(f"记录主动对话到记忆失败: {e}")
+
+    async def run_mcp_tool(
+        self, plugin_name: str, tool_name: str, params: Optional[Dict[str, Any]] = None
+    ) -> Any:
+        """执行 MCP 扩展中的指定工具"""
+        if not self.mcp_manager:
+            raise ValueError("MCP 扩展未初始化")
+        return await self.mcp_manager.execute_tool(plugin_name, tool_name, params or {})
+    
+    async def test_connection(self) -> bool:
+        """测试LLM连接"""
+        self._refresh_provider()
+        return await self.provider.test_connection()
+    
+    async def synthesize_speech(self, text: str, voice: Optional[str] = None, user_id: str = "default") -> Optional[bytes]:
+        """合成语音"""
+        await self._get_user_config(user_id)
+
+        tts_manager = self._get_user_tts_manager(user_id) or self.tts_manager
+        if not tts_manager:
+            return None
+
+        tts_text = tts_manager.select_text_for_tts(text)
+        if not tts_text:
+            return None
+        
+        try:
+            return await tts_manager.synthesize(tts_text, voice)
+        except Exception as e:
+            print(f"TTS合成失败: {str(e)}")
+            return None
+
+    def maybe_get_emote_payload(self, user_message: str, assistant_response: str) -> Optional[Dict[str, Any]]:
+        """根据上下文与概率返回一张表情包（前端/适配器可用）"""
+        if not self.emote_manager:
+            return None
+        try:
+            selection = self.emote_manager.select_emote(user_message, assistant_response)
+            if not selection:
+                return None
+            return selection.to_public_dict()
+        except Exception as e:
+            print(f"选择表情包失败: {str(e)}")
+            return None
+    
+    def is_voice_only_mode(self, user_id: str = "default") -> bool:
+        """是否开启仅语音回复模式（有音频时不发送文本）"""
+        tts_manager = self._user_tts_managers.get(user_id) or self._get_user_tts_manager(user_id) or self.tts_manager
+        if not tts_manager:
+            return False
+        try:
+            return bool(getattr(tts_manager.config, "voice_only_when_tts", False))
+        except Exception:
+            return False
+
+    def strip_tts_text(self, text: str, user_id: str = "default") -> str:
+        """移除已用于TTS的文本，避免重复"""
+        tts_manager = self._user_tts_managers.get(user_id) or self._get_user_tts_manager(user_id) or self.tts_manager
+        if not tts_manager:
+            return text
+        try:
+            return tts_manager.get_remaining_text(text)
+        except Exception:
+            return text
+
+    def get_last_tts_text(self, user_id: str = "default") -> Optional[str]:
+        """获取最近一次真正送入TTS引擎的文本。"""
+        tts_manager = self._user_tts_managers.get(user_id) or self._get_user_tts_manager(user_id) or self.tts_manager
+        if not tts_manager:
+            return None
+        try:
+            return tts_manager.get_last_synthesized_text()
+        except Exception:
+            return None
+
+    def _sanitize_for_memory(self, text: str, max_length: int = 400) -> str:
+        """存入记忆前的轻量清洗，去掉CQ码/冗长提示，做长度压缩。"""
+        if not text:
+            return ""
+        cleaned = text.replace("\r", "")
+        # 去掉CQ码等富文本标签
+        cleaned = re.sub(r"\[CQ:[^\]]+\]", "", cleaned)
+        # 图片生成请求/结果：只保留精简提示
+        if cleaned.startswith("[图片生成请求]") or cleaned.startswith("[图片生成结果]"):
+            try:
+                prefix, prompt = cleaned.split("]", 1)
+                prompt = prompt.strip()
+                short_prompt = prompt[:120] + ("..." if len(prompt) > 120 else "")
+                cleaned = f"{prefix}] {short_prompt}"
+            except ValueError:
+                cleaned = cleaned.strip()
+        # 图片描述：缩成摘要，避免长段堆入记忆
+        markers = [
+            "这是一个图片的描述",
+            "这是一张图片的描述",
+            "以下是对这张图片的详细描述",
+            "好的，这是一幅"
+        ]
+        for marker in markers:
+            if marker in cleaned:
+                before, after = cleaned.split(marker, 1)
+                summary = after.strip()
+                summary = summary[:180] + ("..." if len(summary) > 180 else "")
+                cleaned = (before + "\n[图片描述摘要] " + summary).strip()
+                break
+        # 压缩多余空行/空白
+        cleaned = re.sub(r"\n{2,}", "\n", cleaned).strip()
+        if len(cleaned) > max_length:
+            cleaned = cleaned[:max_length].rstrip() + "..."
+        return cleaned
+
+    async def _check_reminder_intent(self, message: str, user_id: str, session_id: str) -> str:
+        """检测待办事项意图并创建待办事项"""
+        if not self.memory_manager:
+            return ""
+
+        try:
+            # 确保记忆管理器已初始化
+            if not await self._ensure_memory_manager_initialized():
+                print("[Bot] 记忆管理器初始化失败，无法创建待办事项")
+                return ""
+
+            # 检查是否启用待办事项功能
+            reminder_config = config.get("reminder", {})
+            if not reminder_config.get("enabled", True):
+                return ""
+
+            # 创建待办事项检测器
+            from ..memory.reminder_detector import ReminderDetector
+            timezone = reminder_config.get("timezone", "Asia/Shanghai")
+            detector = None
+            try:
+                detector = ReminderDetector(self.provider, timezone)
+                print(f"[Bot] 待办事项检测器创建成功，时区: {timezone}")
+            except Exception as e:
+                print(f"[Bot] 创建待办事项检测器失败（时区问题）: {e}")
+                # 使用本地时间
+                try:
+                    detector = ReminderDetector(self.provider, None)
+                    print(f"[Bot] 使用本地时间创建检测器成功")
+                except Exception as e2:
+                    print(f"[Bot] 创建本地时间检测器也失败: {e2}")
+                    return ""
+
+            # 检测待办事项意图
+            if not detector:
+                return ""
+            reminder_data = await detector.detect_reminder_intent(message)
+
+            if reminder_data:
+                # 创建待办事项
+                success = await self.memory_manager.add_reminder(
+                    user_id=user_id,
+                    session_id=session_id,
+                    content=reminder_data.get("content", ""),
+                    trigger_time=reminder_data.get("trigger_time"),
+                    original_message=message,
+                    time_expression=reminder_data.get("time_expression"),
+                    reminder_message=reminder_data.get("reminder_message"),
+                    metadata={"source": "auto_detect"}
+                )
+
+                if success:
+                    print(f"[Bot] 已创建待办事项: {reminder_data.get('content')}")
+                    # 不返回确认消息，由 LLM 自然回复
+                    return ""
+
+        except Exception as e:
+            print(f"[Bot] 检测待办事项意图失败: {e}")
+
+        return ""
+    
+    def clear_history(self, session_id: str = "default", user_id: str = "default"):
+        """清空指定会话的对话历史"""
+        history = self._get_session_history(session_id, user_id)
+        history.clear()
+        system_prompt = self._get_user_system_prompt(user_id)
+        if system_prompt:
+            history.append({
+                "role": "system",
+                "content": system_prompt
+            })
+    
+    def get_history(self, session_id: str = "default", user_id: str = "default") -> List[Dict[str, str]]:
+        """获取指定会话的对话历史"""
+        return self._get_session_history(session_id, user_id).copy()
+    
+    def should_generate_image(self, message: str, user_id: str = "default") -> Optional[str]:
+        """检查是否应该生成图像
+        
+        Args:
+            message: 用户消息
+            
+        Returns:
+            提取的提示词，如果不触发则返回None
+        """
+        image_mgr = self._user_image_gen_managers.get(user_id) or self._get_user_image_gen_manager(user_id) or self.image_gen_manager
+        if image_mgr is None:
+            return None
+        return image_mgr.should_trigger_image_generation(message)
+     
+    async def generate_image(
+        self,
+        prompt: str,
+        user_id: str = "default",
+        session_id: Optional[str] = None,
+    ) -> Optional[bytes]:
+        """生成图像
+        
+        Args:
+            prompt: 图像生成提示词
+            
+        Returns:
+            图像二进制数据，失败返回None
+        """
+        session_id = session_id or user_id
+        await self._get_user_config(user_id)
+
+        image_mgr = self._get_user_image_gen_manager(user_id) or self.image_gen_manager
+        if not image_mgr:
+            return None
+        enhanced_prompt = prompt
+        try:
+            # 使用本地词库增强提示词，提升人像细节
+            from ..prompt_enhancer import get_enhancer
+
+            enhancer = get_enhancer()
+            enhanced_prompt = enhancer.enhance_prompt(prompt)
+            # 控制台直出，方便后台确认生图实际使用的提示词
+            print(f"[PromptEnhancer] 原始: {prompt} | 增强后: {enhanced_prompt}")
+            self.logger.info("[PromptEnhancer] 原始: %s | 增强后: %s", prompt, enhanced_prompt)
+        except Exception as e:
+            print(f"[DEBUG] 提示词增强失败，使用原始提示词: {e}")
+
+        image = await image_mgr.generate_image(enhanced_prompt)
+        if image:
+            await self._record_image_generation(user_id, session_id, enhanced_prompt)
+        return image
+ 
+    async def _record_image_generation(self, user_id: str, session_id: str, prompt: str):
+        """把图片生成事件写入对话上下文和记忆，方便后续追问"""
+        try:
+            await self._load_history_from_memory(user_id, session_id)
+        except Exception as e:
+            print(f"[DEBUG] 加载历史用于图片记录失败: {e}")
+
+        short_prompt = self._sanitize_for_memory(prompt, max_length=160)
+        note = f"[图片生成] 提示词：{short_prompt}"
+        history = self._get_session_history(session_id, user_id)
+        history.append({
+            "role": "assistant",
+            "content": note,
+            "timestamp": get_now().isoformat()
+        })
+        self._trim_conversation_history(session_id, user_id)
+
+        try:
+            await self._add_conversation_to_memory(
+                user_id,
+                session_id,
+                f"[图片生成请求] {short_prompt}",
+                f"[图片生成结果] {short_prompt}"
+            )
+        except Exception as e:
+            print(f"[DEBUG] 图片生成写入记忆失败: {e}")
+
+    def _extract_image_prompt_from_response(self, response: str) -> Tuple[str, Optional[str]]:
+        """解析回复中的 [GEN_IMG: ...] 标签
+
+        Args:
+            response: LLM返回的原始回复
+
+        Returns:
+            (清理后的文本, 图片提示词)，如果没有图片标签则返回 (原始文本, None)
+        """
+        return extract_gen_img_prompt(response)
+
+    async def _process_image_in_response(
+        self,
+        response: str,
+        user_id: str,
+        session_id: Optional[str] = None
+    ) -> Tuple[str, Optional[bytes]]:
+        """处理回复中的图片标签并生成图片
+
+        Args:
+            response: LLM返回的原始回复
+            user_id: 用户ID
+            session_id: 会话ID
+
+        Returns:
+            (清理后的文本, 图片数据)，如果没有图片或生成失败则返回 (清理后的文本, None)
+        """
+        cleaned_text, image_prompt = self._extract_image_prompt_from_response(response)
+
+        if not image_prompt:
+            return response, None
+
+        # 检查图片生成是否启用
+        image_mgr = self._get_user_image_gen_manager(user_id) or self.image_gen_manager
+        if not image_mgr:
+            print(f"[DEBUG] 图片生成管理器未启用，忽略生图请求")
+            return cleaned_text or response, None
+
+        # 生成图片
+        try:
+            image_bytes = await self.generate_image(image_prompt, user_id=user_id, session_id=session_id)
+            if image_bytes:
+                print(f"[Bot] 成功生成图片: {image_prompt}")
+                return cleaned_text or response, image_bytes
+            else:
+                print(f"[Bot] 图片生成失败，返回纯文本")
+                return cleaned_text or response, None
+        except Exception as e:
+            print(f"[Bot] 处理图片生成时出错: {e}")
+            return cleaned_text or response, None
+
+    def get_last_generated_image(self) -> Optional[Dict[str, Any]]:
+        """获取并清除最近生成的图片数据
+
+        Returns:
+            包含图片数据的字典，如果没有图片则返回None
+        """
+        image_data = self._last_generated_image
+        self._last_generated_image = None
+        return image_data
+
+    def get_image_gen_config(self) -> Dict[str, Any]:
+        """获取图像生成配置"""
+        if not self.image_gen_manager:
+            return {}
+        return self.image_gen_manager.config.dict()
+    
+    def update_image_gen_config(self, config_dict: Dict[str, Any]):
+        """更新图像生成配置"""
+        if not self.image_gen_manager:
+            return
+        try:
+            # 获取当前配置
+            current_config = self.image_gen_manager.config.dict()
+            
+            # 深度合并配置：用新配置更新当前配置，但保留新配置中未提供的字段
+            merged_config = self._deep_merge_config(current_config, config_dict)
+            
+            # 更新内存中的配置
+            new_config = ImageGenerationConfig(**merged_config)
+            self.image_gen_manager.update_config(new_config)
+            
+            # 持久化配置到文件
+            config.update_config('image_generation', merged_config)
+            print(f"图像生成配置已更新并保存: {merged_config}")
+        except Exception as e:
+            print(f"更新图像生成配置失败: {str(e)}")
+            raise e
+    
+    async def test_image_gen_connection(self) -> bool:
+        """测试图像生成连接"""
+        if not self.image_gen_manager:
+            return False
+        return await self.image_gen_manager.test_connection()
+    
+    def should_recognize_image(self, message_segments: list) -> bool:
+        """检查是否应该识别图片
+        
+        Args:
+            message_segments: 消息段列表
+            
+        Returns:
+            是否触发识别
+        """
+        if not self.vision_manager:
+            return False
+        return self.vision_manager.should_trigger_vision_recognition(message_segments)
+    
+    async def recognize_image(self, image_url: Optional[str] = None, image_data: Optional[bytes] = None,
+                             prompt: Optional[str] = None) -> str:
+        """识别图片
+
+        Args:
+            image_url: 图片URL
+            image_data: 图片二进制数据
+            prompt: 识别提示词
+
+        Returns:
+            识别结果文本
+        """
+        if not self.vision_manager:
+            return ""
+        return await self.vision_manager.recognize_image(image_url, image_data, prompt)
+
+    async def transcribe_voice(self, audio_data: bytes, filename: str = "audio.mp3") -> str:
+        """语音转文本
+
+        Args:
+            audio_data: 音频二进制数据
+            filename: 文件名
+
+        Returns:
+            识别结果文本
+        """
+        if not self.asr_manager:
+            return ""
+        return await self.asr_manager.transcribe_audio(audio_data, filename)
+
+    def get_vision_config(self) -> Dict[str, Any]:
+        """获取视觉识别配置"""
+        if not self.vision_manager:
+            return {}
+        config = self.vision_manager.config.dict()
+        print(f"[DEBUG] Bot实例ID: {id(self)}, get_vision_config返回: follow_up_timeout={config.get('follow_up_timeout', 'NOT FOUND')}")
+        return config
+    
+    def update_vision_config(self, config_dict: Dict[str, Any]):
+        """更新视觉识别配置"""
+        if not self.vision_manager:
+            return
+        try:
+            # 获取当前配置
+            current_config = self.vision_manager.config.dict()
+            print(f"[DEBUG] 更新视觉识别配置 - 当前配置: {list(current_config.keys())}")
+            print(f"[DEBUG] 当前配置包含modelscope: {'modelscope' in current_config}")
+            if 'modelscope' in current_config:
+                print(f"[DEBUG] modelscope包含字段: {list(current_config['modelscope'].keys())}")
+            
+            print(f"[DEBUG] 收到的新配置: {list(config_dict.keys())}")
+            if 'modelscope' in config_dict:
+                print(f"[DEBUG] 新配置包含modelscope: {config_dict['modelscope']}")
+            if 'follow_up_timeout' in config_dict:
+                print(f"[DEBUG] 新配置follow_up_timeout值: {config_dict['follow_up_timeout']}")
+            
+            # 深度合并配置：用新配置更新当前配置，但保留新配置中未提供的字段
+            merged_config = self._deep_merge_config(current_config, config_dict)
+            print(f"[DEBUG] 合并后配置: {list(merged_config.keys())}")
+            if 'modelscope' in merged_config:
+                print(f"[DEBUG] 合并后modelscope包含字段: {list(merged_config['modelscope'].keys())}")
+            if 'follow_up_timeout' in merged_config:
+                print(f"[DEBUG] 合并后follow_up_timeout值: {merged_config['follow_up_timeout']}")
+                # 安全地检查api_key是否存在
+                if 'api_key' in merged_config['modelscope']:
+                    api_key = merged_config['modelscope']['api_key']
+                    if api_key:
+                        print(f"[DEBUG] modelscope api_key存在，长度: {len(api_key)}")
+                    else:
+                        print(f"[WARNING] modelscope api_key为空!")
+                else:
+                    print(f"[ERROR] modelscope缺少api_key字段!")
+            
+            # 更新内存中的配置
+            new_config = VisionRecognitionConfig(**merged_config)
+            self.vision_manager.update_config(new_config)
+            
+            # 持久化配置到文件
+            config.update_config('vision', merged_config)
+            print(f"视觉识别配置已更新并保存")
+        except Exception as e:
+            print(f"更新视觉识别配置失败: {str(e)}")
+            raise e
+    
+    def _deep_merge_config(self, current: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+        """深度合并配置字典
+        
+        Args:
+            current: 当前配置字典
+            new: 新配置字典
+            
+        Returns:
+            合并后的配置字典
+        """
+        result = current.copy()
+        
+        for key, value in new.items():
+            if key not in result:
+                # 新键，直接添加
+                result[key] = value
+            elif isinstance(result[key], dict) and isinstance(value, dict):
+                # 递归合并嵌套字典
+                result[key] = self._deep_merge_config(result[key], value)
+            elif value is not None and value != "" and value != {} and value != []:
+                # 非空值，更新
+                result[key] = value
+            # 空值保持不变，避免覆盖现有配置
+        
+        return result
+    
+    async def test_vision_connection(self) -> bool:
+        """测试视觉识别连接"""
+        if not self.vision_manager:
+            return False
+        return await self.vision_manager.test_connection()

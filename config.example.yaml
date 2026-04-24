@@ -1,0 +1,112 @@
+server:
+  debug: false
+  host: 0.0.0.0
+  port: 8002
+
+cors:
+  allow_origins:
+    - http://localhost:3000
+    - http://127.0.0.1:3000
+    - http://localhost:5173
+    - http://127.0.0.1:5173
+
+admin:
+  enabled: true
+  api_key: change-me
+
+llm:
+  provider: openai
+  api_base: https://api.openai.com/v1
+  api_key: your-llm-api-key
+  model: gpt-4o-mini
+  max_tokens: 900
+  temperature: 0.8
+  memory:
+    long_term_enabled: true
+    long_term_strategy: local
+    embedding_provider: openai
+    embedding_api_base: https://api.openai.com/v1
+    embedding_api_key: your-embedding-api-key
+    embedding_model: text-embedding-3-small
+    embedding_dimensions: 1536
+
+tts:
+  enabled: false
+  provider: qwen
+  qwen:
+    api_key: your-tts-api-key
+    model: qwen-tts
+
+asr:
+  enabled: false
+  provider: siliconflow
+  siliconflow:
+    api_base: https://api.siliconflow.cn/v1
+    api_key: your-asr-api-key
+    model: TeleAI/TeleSpeechASR
+    timeout: 30
+
+image_generation:
+  enabled: false
+  provider: modelscope
+  modelscope:
+    api_key: your-image-api-key
+    model: Tongyi-MAI/Z-Image-Turbo
+    timeout: 120
+
+vision:
+  enabled: false
+  provider: modelscope
+  modelscope:
+    api_key: your-vision-api-key
+    model: Qwen/Qwen3-VL-30B-A3B-Instruct
+    timeout: 120
+
+memory:
+  long_term_enabled: true
+  long_term_strategy: local
+
+emotes:
+  enabled: true
+  base_path: backend/data/emotes
+  file_extensions:
+    - png
+    - jpg
+    - jpeg
+    - gif
+    - webp
+  categories: []
+
+adapters:
+  console:
+    enabled: true
+  qq:
+    enabled: false
+    ws_host: 127.0.0.1
+    ws_port: 3001
+  linyu:
+    enabled: false
+    http_host: 127.0.0.1
+    http_port: 9200
+    ws_host: 127.0.0.1
+    ws_port: 9100
+
+proactive_chat:
+  enabled: false
+
+clock:
+  timezone: Asia/Shanghai
+
+reminder:
+  enabled: true
+  check_interval: 60
+
+mcp:
+  enabled: true
+
+prompt_enhancer:
+  enabled: true
+
+voice_gateway:
+  enabled: false
+
